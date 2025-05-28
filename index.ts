@@ -1,10 +1,11 @@
+// index.ts
 import 'dotenv/config';
-import { MmtSDK, TickMath } from '@mmt-finance/clmm-sdk';
-import { Transaction } from '@mysten/sui/transactions';
-import { SuiClient, SuiHTTPTransport } from '@mysten/sui/client';
-import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
-import { Buffer } from 'buffer';
-import Decimal from 'decimal.js';
+import { getFullnodeUrl, SuiClient } from '@mysten/sui.js/client';
+import { Ed25519Keypair } from '@mysten/sui.js/keypairs/ed25519';
+import { fromB64 } from '@mysten/sui.js/utils';
+import { buildSwapTransactionPayload, SwapParams, Percentage } from '@mmt-finance/clmm-sdk';
+import { TransactionBlock } from '@mysten/sui.js/transactions';
+import { exec } from 'child_process';
 
 const TOKENS = {
   USDT: {
@@ -26,113 +27,61 @@ const POOL = {
   tickSpacing: 1,
 };
 
-const NETWORKS = {
-  mainnet: 'https://fullnode.mainnet.sui.io:443',
-  testnet: 'https://fullnode.testnet.sui.io:443',
-};
+const MNEMONIC = process.env.MNEMONIC;
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const SLIPPAGE_PERCENTAGE = parseFloat(process.env.SLIPPAGE_PERCENTAGE || '0.1');
+const DELAY_MS = 61000; // 61 detik
+const ITERATIONS = 100;
 
-const client = new SuiClient({
-  transport: new SuiHTTPTransport({ url: NETWORKS[process.env.NETWORK || 'mainnet'] }),
-});
+const client = new SuiClient({ url: getFullnodeUrl('mainnet') });
+const keypair = PRIVATE_KEY
+  ? Ed25519Keypair.fromSecretKey(fromB64(PRIVATE_KEY))
+  : Ed25519Keypair.deriveKeypair({ mnemonic: MNEMONIC! });
+const address = keypair.getPublicKey().toSuiAddress();
 
-const DEFAULT_PRICE = 1.0001;
+async function getTokenBalance(coinType: string): Promise<bigint> {
+  const balance = await client.getBalance({ owner: address, coinType });
+  return BigInt(balance.totalBalance);
+}
 
-async function fetchCurrentPrice(sdk, pool) {
-  try {
-    const poolData = await sdk.Pool.getPool(pool.poolId);
-    if (!poolData?.current_sqrt_price) return new Decimal(DEFAULT_PRICE);
-    return TickMath.sqrtPriceX64ToPrice(poolData.current_sqrt_price, pool.decimalX, pool.decimalY);
-  } catch {
-    return new Decimal(DEFAULT_PRICE);
+async function performSwap(inputToken: keyof typeof TOKENS, outputToken: keyof typeof TOKENS) {
+  const input = TOKENS[inputToken];
+  const output = TOKENS[outputToken];
+  const inputBalance = await getTokenBalance(input.type);
+  if (inputBalance <= 0n) return console.log(`Saldo ${inputToken} kosong.`);
+
+  const amount = inputBalance;
+  const params: SwapParams = {
+    pool_id: POOL.poolId,
+    coin_in_type: input.type,
+    coin_out_type: output.type,
+    amount_in: amount.toString(),
+    a_to_b: inputToken === 'USDT',
+    by_amount_in: true,
+    slippage: Percentage.fromDecimal(SLIPPAGE_PERCENTAGE / 100),
+  };
+
+  const tx = new TransactionBlock();
+  const payload = await buildSwapTransactionPayload(client, tx, params);
+  const result = await client.signAndExecuteTransactionBlock({
+    transactionBlock: payload,
+    signer: keypair,
+    options: { showEffects: true },
+  });
+
+  console.log(`${inputToken} -> ${outputToken} | Status:`, result.effects?.status.status);
+}
+
+(async () => {
+  for (let i = 0; i < ITERATIONS; i++) {
+    console.log(`\n[${i + 1}/${ITERATIONS}] Swapping USDT -> USDC`);
+    await performSwap('USDT', 'USDC');
+    console.log(`[${i + 1}/${ITERATIONS}] Delay 61s...`);
+    await new Promise((r) => setTimeout(r, DELAY_MS));
+
+    console.log(`\n[${i + 1}/${ITERATIONS}] Swapping USDC -> USDT`);
+    await performSwap('USDC', 'USDT');
+    console.log(`[${i + 1}/${ITERATIONS}] Delay 61s...`);
+    await new Promise((r) => setTimeout(r, DELAY_MS));
   }
-}
-
-async function getAllCoins(coinType: string, owner: string) {
-  const result = await client.getCoins({ owner, coinType });
-  return result.data || [];
-}
-
-async function executeSwap(
-  sdk, keypair, address, from, to, pool, slippagePct
-) {
-  const coinType = from === 'USDT' ? TOKENS.USDT.type : TOKENS.USDC.type;
-  const coins = await getAllCoins(coinType, address);
-  const amount = coins.reduce((sum, c) => sum + BigInt(c.balance), 0n);
-  if (amount === 0n) {
-    console.log(`⚠️ Tidak ada saldo ${from} untuk swap.`);
-    return;
-  }
-
-  const tx = new Transaction();
-  let inputCoin = coins[0].coinObjectId;
-
-  if (coins.length > 1) {
-    const primary = coins[0].coinObjectId;
-    const rest = coins.slice(1).map(c => c.coinObjectId);
-    tx.mergeCoins(primary, rest);
-    inputCoin = tx.splitCoins(primary, [amount]);
-  } else {
-    inputCoin = tx.splitCoins(inputCoin, [amount]);
-  }
-
-  const isXtoY = from === 'USDT';
-  const price = await fetchCurrentPrice(sdk, pool);
-  const limitPrice = isXtoY
-    ? price.mul(new Decimal(1 - slippagePct / 100))
-    : new Decimal(1).div(price).mul(new Decimal(1 - slippagePct / 100));
-  const limitSqrt = TickMath.priceToSqrtPriceX64(limitPrice, pool.decimalX, pool.decimalY);
-
-  sdk.Pool.swap(
-    tx,
-    {
-      objectId: pool.poolId,
-      tokenXType: pool.tokenXType,
-      tokenYType: pool.tokenYType,
-      tickSpacing: pool.tickSpacing,
-    },
-    amount,
-    inputCoin,
-    isXtoY,
-    address,
-    limitSqrt
-  );
-
-  const result = await client.signAndExecuteTransaction({ signer: keypair, transaction: tx });
-  console.log(`✅ Swap ${from} → ${to}: ${result.digest}`);
-}
-
-async function delay(ms: number) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function main() {
-  const privateKey = process.env.PRIVATE_KEY?.replace(/^0x/, '');
-  if (!privateKey || privateKey.length !== 64) throw new Error('PRIVATE_KEY invalid');
-
-  const slippage = parseFloat(process.env.SLIPPAGE_PERCENTAGE || '0.1');
-  const keypair = Ed25519Keypair.fromSecretKey(Uint8Array.from(Buffer.from(privateKey, 'hex')));
-  const address = keypair.getPublicKey().toSuiAddress();
-
-  const sdk = MmtSDK.NEW({ network: process.env.NETWORK || 'mainnet' });
-
-  for (let i = 1; i <= 100; i++) {
-    console.log(`\n🔁 Cycle ${i}/100`);
-
-    try {
-      await executeSwap(sdk, keypair, address, 'USDT', 'USDC', POOL, slippage);
-      await delay(61000);
-      await executeSwap(sdk, keypair, address, 'USDC', 'USDT', POOL, slippage);
-    } catch (err) {
-      console.error('❌ Swap error:', err.message);
-    }
-
-    if (i < 100) {
-      console.log('⏳ Waiting 61s before next cycle...');
-      await delay(61000);
-    }
-  }
-
-  console.log('✅ Completed 100 cycles of bidirectional swap.');
-}
-
-main();
+})();
